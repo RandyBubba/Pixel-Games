@@ -125,7 +125,7 @@
   <script>
   (() => {
     const EMPTY = 0, SAND = 1, WATER = 2, STONE = 3, TNT = 4, TNT_LIT = 5,
-          WOOD = 6, FIRE = 7, TERMITE = 8;
+          WOOD = 6, FIRE = 7, TERMITE = 8, METAL = 9, STEEL = 10;
     const IGNITE_TOOL = -1;
 
     const MATERIALS = [
@@ -133,6 +133,8 @@
       { id: WATER,       name: "Water",   color: "#3a8dde" },
       { id: STONE,       name: "Stone",   color: "#7a7f8a" },
       { id: WOOD,        name: "Wood",    color: "#6b4a2b" },
+      { id: METAL,       name: "Metal",   color: "#b8c0cc" },
+      { id: STEEL,       name: "Steel",   color: "#3a4553" },
       { id: TNT,         name: "TNT",     color: "#c94a3a" },
       { id: IGNITE_TOOL, name: "Ignite",  color: "#ffb000" },
       { id: TERMITE,     name: "Termite", color: "#2a1d12" },
@@ -170,7 +172,22 @@
       [WOOD]:    [107, 74, 43, 255],
       [FIRE]:    [255, 107, 30, 255],
       [TERMITE]: [42, 29, 18, 255],
+      [METAL]:   [184, 192, 204, 255],
+      [STEEL]:   [58, 69, 83, 255],
     };
+
+    // A metal cell's "thickness" is the min of the horizontal and vertical
+    // runs of metal passing through it — i.e. the thinnest dimension of the
+    // wall at that spot (in pixels == mm).
+    function metalThickness(x, y) {
+      let h = 1;
+      for (let dx = 1; inBounds(x + dx, y) && grid[idx(x + dx, y)] === METAL; dx++) h++;
+      for (let dx = 1; inBounds(x - dx, y) && grid[idx(x - dx, y)] === METAL; dx++) h++;
+      let v = 1;
+      for (let dy = 1; inBounds(x, y + dy) && grid[idx(x, y + dy)] === METAL; dy++) v++;
+      for (let dy = 1; inBounds(x, y - dy) && grid[idx(x, y - dy)] === METAL; dy++) v++;
+      return h < v ? h : v;
+    }
 
     const FUSE_FRAMES = 30;
     const EXPLOSION_RADIUS = 10;
@@ -203,6 +220,9 @@
     function explode(cx, cy) {
       const r = EXPLOSION_RADIUS;
       const r2 = r * r;
+      // Two passes: decide, then apply. Otherwise destroying the outer layer
+      // of a wall would shrink the thickness measurement for cells deeper in.
+      const changes = [];
       for (let dy = -r; dy <= r; dy++) {
         for (let dx = -r; dx <= r; dx++) {
           const d2 = dx * dx + dy * dy;
@@ -211,19 +231,31 @@
           if (!inBounds(x, y)) continue;
           const i = idx(x, y);
           const m = grid[i];
-          // Chain-ignite TNT at the edge of the blast so it cascades.
-          if (m === TNT && d2 > (r - 2) * (r - 2)) {
-            grid[i] = TNT_LIT;
-            meta[i] = 4 + ((Math.random() * 8) | 0);
+          // Steel survives anything.
+          if (m === STEEL) continue;
+          // Metal: thick walls survive; thin walls break in proportion to proximity.
+          if (m === METAL) {
+            const thick = metalThickness(x, y);
+            if (thick >= 3) continue;
+            const d = Math.sqrt(d2);
+            // thickness 1 → full radius can destroy; thickness 2 → only close hits destroy.
+            const destroyChance = Math.max(0, 1 - (d / r) * thick);
+            if (Math.random() < destroyChance) changes.push([i, EMPTY, 0]);
             continue;
           }
-          // Everything else in the blast radius is obliterated.
-          grid[i] = EMPTY;
-          meta[i] = 0;
+          if (m === TNT && d2 > (r - 2) * (r - 2)) {
+            changes.push([i, TNT_LIT, 4 + ((Math.random() * 8) | 0)]);
+            continue;
+          }
+          changes.push([i, EMPTY, 0]);
         }
       }
+      for (const [i, g, mv] of changes) {
+        grid[i] = g;
+        meta[i] = mv;
+      }
       // Throw fire embers in a ring around and beyond the blast edge so the
-      // explosion can catch nearby wood on fire.
+      // explosion can catch nearby wood on fire. Embers won't land on metal/steel.
       const embers = 28;
       for (let k = 0; k < embers; k++) {
         const angle = Math.random() * Math.PI * 2;
@@ -249,7 +281,7 @@
           const x = leftToRight ? k : (W - 1 - k);
           const i = idx(x, y);
           const m = grid[i];
-          if (m === EMPTY || m === STONE) continue;
+          if (m === EMPTY || m === STONE || m === METAL || m === STEEL) continue;
 
           if (m === WOOD) {
             // Catches fire from adjacent fire.
@@ -523,7 +555,8 @@
               meta[ci] = 0;
             }
           } else {
-            const solid = material === STONE || material === TNT || material === WOOD;
+            const solid = material === STONE || material === TNT || material === WOOD
+                       || material === METAL || material === STEEL;
             if (solid || grid[ci] === EMPTY || Math.random() < 0.7) {
               grid[ci] = material;
               meta[ci] = 0;
