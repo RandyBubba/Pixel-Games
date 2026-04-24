@@ -114,7 +114,7 @@
       <input type="range" id="brush" min="1" max="20" value="5" />
       <span id="brushValue" class="hint">5</span>
       <button id="clear">Clear</button>
-      <span class="hint">Click or drag to paint. Right-click to erase.</span>
+      <span class="hint">Click or drag to paint. Right-click to erase. Pick Ignite, then click TNT to light the fuse.</span>
     </div>
 
     <div class="stage">
@@ -124,13 +124,16 @@
 
   <script>
   (() => {
-    const EMPTY = 0, SAND = 1, WATER = 2, STONE = 3;
+    const EMPTY = 0, SAND = 1, WATER = 2, STONE = 3, TNT = 4, TNT_LIT = 5;
+    const IGNITE_TOOL = -1;
 
     const MATERIALS = [
-      { id: SAND,  name: "Sand",  color: "#d9b26a" },
-      { id: WATER, name: "Water", color: "#3a8dde" },
-      { id: STONE, name: "Stone", color: "#7a7f8a" },
-      { id: EMPTY, name: "Erase", color: "#05070b" },
+      { id: SAND,        name: "Sand",   color: "#d9b26a" },
+      { id: WATER,       name: "Water",  color: "#3a8dde" },
+      { id: STONE,       name: "Stone",  color: "#7a7f8a" },
+      { id: TNT,         name: "TNT",    color: "#c94a3a" },
+      { id: IGNITE_TOOL, name: "Ignite", color: "#ffb000" },
+      { id: EMPTY,       name: "Erase",  color: "#05070b" },
     ];
 
     const canvas = document.getElementById("world");
@@ -151,14 +154,20 @@
     window.addEventListener("resize", fitCanvas);
 
     const grid = new Uint8Array(W * H);
+    const meta = new Uint8Array(W * H); // per-cell state (TNT fuse countdown)
     const img = ctx.createImageData(W, H);
 
     const COLORS = {
-      [EMPTY]: [5, 7, 11, 255],
-      [SAND]:  [217, 178, 106, 255],
-      [WATER]: [58, 141, 222, 255],
-      [STONE]: [122, 127, 138, 255],
+      [EMPTY]:   [5, 7, 11, 255],
+      [SAND]:    [217, 178, 106, 255],
+      [WATER]:   [58, 141, 222, 255],
+      [STONE]:   [122, 127, 138, 255],
+      [TNT]:     [201, 74, 58, 255],
+      [TNT_LIT]: [255, 200, 60, 255],
     };
+
+    const FUSE_FRAMES = 30;
+    const EXPLOSION_RADIUS = 10;
 
     const idx = (x, y) => y * W + x;
     const inBounds = (x, y) => x >= 0 && x < W && y >= 0 && y < H;
@@ -167,6 +176,33 @@
       const t = grid[a];
       grid[a] = grid[b];
       grid[b] = t;
+      const mt = meta[a];
+      meta[a] = meta[b];
+      meta[b] = mt;
+    }
+
+    function explode(cx, cy) {
+      const r = EXPLOSION_RADIUS;
+      const r2 = r * r;
+      for (let dy = -r; dy <= r; dy++) {
+        for (let dx = -r; dx <= r; dx++) {
+          const d2 = dx * dx + dy * dy;
+          if (d2 > r2) continue;
+          const x = cx + dx, y = cy + dy;
+          if (!inBounds(x, y)) continue;
+          const i = idx(x, y);
+          const m = grid[i];
+          // Chain-ignite TNT at the edge of the blast so it cascades.
+          if (m === TNT && d2 > (r - 2) * (r - 2)) {
+            grid[i] = TNT_LIT;
+            meta[i] = 4 + ((Math.random() * 8) | 0);
+            continue;
+          }
+          // Everything else in the blast radius is obliterated.
+          grid[i] = EMPTY;
+          meta[i] = 0;
+        }
+      }
     }
 
     // Single simulation step. Iterate bottom-up so gravity propagates in one pass.
@@ -179,6 +215,56 @@
           const i = idx(x, y);
           const m = grid[i];
           if (m === EMPTY || m === STONE) continue;
+
+          if (m === TNT_LIT) {
+            let fuse = meta[i];
+            if (fuse <= 1) {
+              explode(x, y);
+              continue;
+            }
+            meta[i] = fuse - 1;
+            // Lit TNT still falls like sand.
+            if (y + 1 < H) {
+              const below = grid[idx(x, y + 1)];
+              if (below === EMPTY || below === WATER) {
+                swap(i, idx(x, y + 1));
+                continue;
+              }
+              const dir = Math.random() < 0.5 ? -1 : 1;
+              for (const dx of [dir, -dir]) {
+                const nx = x + dx;
+                if (nx < 0 || nx >= W) continue;
+                const d = grid[idx(nx, y + 1)];
+                if (d === EMPTY || d === WATER) {
+                  swap(i, idx(nx, y + 1));
+                  break;
+                }
+              }
+            }
+            continue;
+          }
+
+          if (m === TNT) {
+            // Falls like sand.
+            if (y + 1 < H) {
+              const below = grid[idx(x, y + 1)];
+              if (below === EMPTY || below === WATER) {
+                swap(i, idx(x, y + 1));
+                continue;
+              }
+              const dir = Math.random() < 0.5 ? -1 : 1;
+              for (const dx of [dir, -dir]) {
+                const nx = x + dx;
+                if (nx < 0 || nx >= W) continue;
+                const d = grid[idx(nx, y + 1)];
+                if (d === EMPTY || d === WATER) {
+                  swap(i, idx(nx, y + 1));
+                  break;
+                }
+              }
+            }
+            continue;
+          }
 
           if (m === SAND) {
             // Fall straight
@@ -238,13 +324,25 @@
 
     function render() {
       const data = img.data;
+      // Flash lit TNT between yellow-hot and red based on a shared time phase
+      // so chain-ignited blocks all pulse in sync — reads as "about to blow."
+      const phase = (performance.now() * 0.02) | 0;
       for (let i = 0; i < grid.length; i++) {
-        const c = COLORS[grid[i]];
+        const g = grid[i];
         const p = i * 4;
-        data[p]     = c[0];
-        data[p + 1] = c[1];
-        data[p + 2] = c[2];
-        data[p + 3] = c[3];
+        if (g === TNT_LIT) {
+          const hot = (phase & 1) === 0;
+          data[p]     = hot ? 255 : 240;
+          data[p + 1] = hot ? 220 : 90;
+          data[p + 2] = hot ? 90  : 40;
+          data[p + 3] = 255;
+        } else {
+          const c = COLORS[g];
+          data[p]     = c[0];
+          data[p + 1] = c[1];
+          data[p + 2] = c[2];
+          data[p + 3] = c[3];
+        }
       }
       ctx.putImageData(img, 0, 0);
     }
@@ -271,13 +369,22 @@
           if (dx * dx + dy * dy > r2) continue;
           const nx = x + dx, ny = y + dy;
           if (!inBounds(nx, ny)) continue;
-          // Leave stone alone when painting fluids, but erase should remove anything.
+          const ci = idx(nx, ny);
+          // Ignite tool: light any TNT cell under the brush.
+          if (material === IGNITE_TOOL) {
+            if (grid[ci] === TNT) {
+              grid[ci] = TNT_LIT;
+              meta[ci] = FUSE_FRAMES;
+            }
+            continue;
+          }
           if (material === EMPTY) {
-            grid[idx(nx, ny)] = EMPTY;
+            grid[ci] = EMPTY;
+            meta[ci] = 0;
           } else {
-            // For fluids/sand, allow overwriting empty cells and (for stone) any cell.
-            if (material === STONE || grid[idx(nx, ny)] === EMPTY || Math.random() < 0.7) {
-              grid[idx(nx, ny)] = material;
+            if (material === STONE || material === TNT || grid[ci] === EMPTY || Math.random() < 0.7) {
+              grid[ci] = material;
+              meta[ci] = 0;
             }
           }
         }
@@ -355,6 +462,7 @@
 
     document.getElementById("clear").addEventListener("click", () => {
       grid.fill(EMPTY);
+      meta.fill(0);
     });
 
     // --- Main loop ---
